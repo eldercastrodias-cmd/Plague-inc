@@ -1,0 +1,321 @@
+// CONTAGION 16 - estrategia de pandemia para Mega Drive (SGDK)
+// Escolhe o patogeno, o paciente zero, evolui a doenca e extingue a humanidade
+// antes de a cura ficar pronta.
+#include <genesis.h>
+#include <string.h>
+
+#define NREG 6
+#define NUP 12
+#define CURE_MAX 1200
+#define SPREAD_MIN_PCT 1
+
+enum { ST_TITLE, ST_PICK, ST_PLAY, ST_PAUSE, ST_WIN, ST_LOSE };
+
+typedef struct { const char *name; u32 pop; u8 climate; u8 x, y, w, h; } Region;
+// climate: 0 frio, 1 quente, 2 temperado. Populacao em milhares.
+static const Region R[NREG] = {
+    {"America N",  600000, 0,  3,  3,  9, 4},
+    {"America S",  430000, 1,  7,  8,  5, 5},
+    {"Europa",     750000, 0, 16,  3,  6, 3},
+    {"Africa",    1300000, 1, 16,  7,  7, 6},
+    {"Asia",      4600000, 2, 23,  3, 12, 6},
+    {"Oceania",     45000, 1, 28, 10,  7, 3}
+};
+
+typedef struct { const char *name; u8 cost, inf, sev, leth; s8 req; } Upgrade;
+static const Upgrade U[NUP] = {
+    {"Ar",           6, 2, 0, 0, -1},
+    {"Agua",         6, 2, 0, 0, -1},
+    {"Aves",         8, 1, 0, 0, -1},
+    {"Tosse",        5, 1, 1, 0, -1},
+    {"Febre",        8, 0, 1, 1,  3},
+    {"Vomitos",      7, 1, 1, 1,  3},
+    {"Pneumonia",   12, 0, 2, 3,  4},
+    {"Hemorragia",  16, 0, 3, 5,  4},
+    {"Falha organ.",20, 0, 3, 7,  7},
+    {"Resist. Frio", 8, 0, 0, 0, -1},
+    {"Resist. Calor",8, 0, 0, 0, -1},
+    {"Resist. Farm.",14, 0, 0, 0, -1}
+};
+
+static const char *typeName[3] = {"BACTERIA", "VIRUS", "FUNGO"};
+static const char *typeDesc[3] = {
+    "Infeta depressa. Cura normal.   ",
+    "Muta: ganha mais DNA.           ",
+    "Lento a detetar. Cura demora.   "
+};
+
+static u32 inf[NREG], dead[NREG];
+static u8 closed[NREG];
+static u8 owned[NUP];
+static u8 state, ptype, startReg, cursor, fast;
+static u8 cureOn, ev50, ev80;
+static u16 dna, cure, detect, day, frame, seedCnt;
+static u8 infect, sev, leth;
+static u16 prevPad;
+static char buf[48];
+static char news[48];
+
+// ---------- utilidades ----------
+static void txt(const char *s, u8 x, u8 y, u8 w) {
+    u8 i = 0;
+    while (s[i] && i < w) { buf[i] = s[i]; i++; }
+    while (i < w) buf[i++] = ' ';
+    buf[w] = 0;
+    VDP_drawText(buf, x, y);
+}
+
+static void num(u8 x, u8 y, u32 v, u8 w) {
+    s16 i; char b[12];
+    b[w] = 0;
+    for (i = w - 1; i >= 0; i--) {
+        if (v > 0 || i == w - 1) { b[i] = '0' + (v % 10); v /= 10; }
+        else b[i] = ' ';
+    }
+    VDP_drawText(b, x, y);
+}
+
+static void setNews(const char *a, const char *b) {
+    strcpy(news, a);
+    if (b) strcat(news, b);
+}
+
+static void recalc(void) {
+    u8 i;
+    infect = (ptype == 0) ? 1 : 0;
+    sev = 0; leth = 0;
+    for (i = 0; i < NUP; i++) if (owned[i]) {
+        infect += U[i].inf; sev += U[i].sev; leth += U[i].leth;
+    }
+}
+
+// ---------- mapa ----------
+static void drawMap(u8 hi) {
+    u8 i;
+    for (i = 0; i < NREG; i++) {
+        u8 t;
+        if (hi != 255) t = (i == hi) ? 4 : 1;
+        else if (dead[i] >= R[i].pop) t = 5;
+        else if (inf[i] == 0 && dead[i] == 0) t = 1;
+        else {
+            u32 f = (inf[i] + dead[i]) * 100 / R[i].pop;
+            t = (f < 10) ? 2 : (f < 40) ? 3 : 4;
+        }
+        VDP_fillTileMapRect(BG_B, TILE_ATTR_FULL(PAL1, FALSE, FALSE, FALSE, TILE_USER_INDEX + t - 1),
+                            R[i].x, R[i].y, R[i].w, R[i].h);
+    }
+}
+
+// ---------- jogo ----------
+static void resetGame(void) {
+    u8 i;
+    for (i = 0; i < NREG; i++) { inf[i] = 0; dead[i] = 0; closed[i] = 0; }
+    for (i = 0; i < NUP; i++) owned[i] = 0;
+    inf[startReg] = 1;
+    dna = 5; cure = 0; detect = 0; day = 0; frame = 0; cursor = 0; fast = 0;
+    cureOn = 0; ev50 = 0; ev80 = 0;
+    recalc();
+    setNews("Paciente zero em ", R[startReg].name);
+    VDP_clearPlane(BG_A, TRUE);
+    VDP_clearPlane(BG_B, TRUE);
+}
+
+static void simulate(void) {
+    u8 i, j;
+    u32 totInf = 0, totDead = 0, totPop = 0;
+    day++;
+
+    for (i = 0; i < NREG; i++) {
+        u32 pop = R[i].pop;
+        u32 healthy = pop - inf[i] - dead[i];
+        if (inf[i] > 0) {
+            u8 f = infect + 1;
+            u32 hfrac = healthy * 100 / pop, add, kill;
+            if (R[i].climate == 0) { if (owned[9]) f++; else f = (f + 1) / 2; }
+            if (R[i].climate == 1) { if (owned[10]) f++; else f = (f + 1) / 2; }
+            if (inf[i] > 200000) add = (inf[i] / 4) * f * hfrac / 625;
+            else add = inf[i] * f * hfrac / 2500;
+            if (add == 0 && healthy > 0 && (random() % 100) < f * 8) add = 1;
+            if (add > healthy) add = healthy;
+
+            kill = inf[i] * leth / 300;
+            if (kill == 0 && leth > 0 && (random() % 100) < leth * 5) kill = 1;
+            if (kill > inf[i]) kill = inf[i];
+
+            inf[i] += add; inf[i] -= kill; dead[i] += kill;
+
+            // propagacao entre regioes
+            if (inf[i] * 100 / pop >= SPREAD_MIN_PCT) {
+                for (j = 0; j < NREG; j++) {
+                    if (inf[j] == 0 && dead[j] == 0) {
+                        u8 ch = infect + 1 + (owned[2] ? 2 : 0);
+                        if (closed[j]) ch /= 4;
+                        if ((random() % 70) < ch) {
+                            inf[j] = 1;
+                            setNews("A doenca chega a ", R[j].name);
+                        }
+                    }
+                }
+            }
+        }
+        if (!closed[i] && dead[i] * 100 / pop >= 5) {
+            closed[i] = 1;
+            setNews(R[i].name, " fecha as fronteiras");
+        }
+        totInf += inf[i]; totDead += dead[i]; totPop += pop;
+    }
+
+    // DNA
+    if ((random() % 4) == 0) {
+        dna += 1 + (u16)(totInf * 10 / totPop) + (ptype == 1 ? 1 : 0);
+    }
+    if (ptype == 1 && (random() % 40) == 0) { dna += 6; setNews("Mutacao! Bonus de DNA", 0); }
+
+    // deteccao e cura
+    if (!cureOn) {
+        u8 g = sev + (totDead > 0 ? 2 : 0);
+        if (ptype == 2 && (day & 1)) g = 0;
+        detect += g;
+        if (detect >= 30) { cureOn = 1; setNews("Cientistas investigam a doenca", 0); }
+    } else {
+        u16 g = 1 + (u16)(totDead * 100 / totPop) / 10 + (u16)(totInf * 100 / totPop) / 25;
+        if (owned[11] && (random() % 3) == 0) g = 0;
+        if (ptype == 2 && (day & 1)) g = 0;
+        cure += g;
+        if (!ev50 && cure >= CURE_MAX / 2) { ev50 = 1; setNews("Cura a meio caminho!", 0); }
+        if (!ev80 && cure >= CURE_MAX * 4 / 5) { ev80 = 1; setNews("Cura quase pronta!", 0); }
+    }
+
+    if (totDead >= totPop) state = ST_WIN;
+    else if (cure >= CURE_MAX || totInf == 0) state = ST_LOSE;
+}
+
+static void drawPlay(void) {
+    u8 i, first, filled; u32 totInf = 0, totDead = 0;
+    for (i = 0; i < NREG; i++) { totInf += inf[i]; totDead += dead[i]; }
+
+    txt("CONTAGION 16", 1, 0, 12);
+    txt(typeName[ptype], 15, 0, 9);
+    VDP_drawText("DIA", 26, 0); num(30, 0, day, 4);
+    txt(fast ? "x2" : "x1", 37, 0, 2);
+
+    txt("Verde:sao  Amar:pouco  Lar:muito  Verm:+40%", 0, 13, 40);
+    VDP_drawText("INFETADOS", 0, 14); num(10, 14, totInf, 8);
+    VDP_drawText("MORTOS", 20, 14);   num(27, 14, totDead, 8);
+
+    VDP_drawText("DNA", 0, 15); num(4, 15, dna, 4);
+    VDP_drawText("INF", 11, 15); num(15, 15, infect, 2);
+    VDP_drawText("SINT", 20, 15); num(25, 15, sev, 2);
+    VDP_drawText("LET", 31, 15); num(35, 15, leth, 2);
+
+    if (!cureOn) txt("CURA: ainda ninguem sabe de nada", 0, 16, 40);
+    else {
+        char b[40]; filled = (u8)((u32)cure * 20 / CURE_MAX);
+        strcpy(b, "CURA [");
+        for (i = 0; i < 20; i++) b[6 + i] = (i < filled) ? '#' : '.';
+        b[26] = ']'; b[27] = 0;
+        txt(b, 0, 16, 40);
+        num(28, 16, (u32)cure * 100 / CURE_MAX, 3);
+        VDP_drawText("%", 31, 16);
+    }
+
+    VDP_drawText("---------- EVOLUCAO ----------", 5, 17);
+    first = (cursor < 2) ? 0 : cursor - 2;
+    if (first > NUP - 5) first = NUP - 5;
+    for (i = 0; i < 5; i++) {
+        u8 k = first + i;
+        VDP_drawText(k == cursor ? ">" : " ", 1, 18 + i);
+        txt(U[k].name, 3, 18 + i, 14);
+        if (owned[k]) txt("[OK]", 19, 18 + i, 20);
+        else if (U[k].req >= 0 && !owned[(u8)U[k].req]) txt("bloqueado", 19, 18 + i, 20);
+        else { VDP_drawText("DNA", 19, 18 + i); num(23, 18 + i, U[k].cost, 3); txt("", 27, 18 + i, 12); }
+    }
+    txt("A:comprar B:vel START:pausa", 1, 24, 38);
+    txt(news, 0, 26, 40);
+}
+
+static void drawOverlay(void) {
+    if (state == ST_PAUSE) txt("== PAUSA ==  START continua", 6, 12, 30);
+    if (state == ST_WIN)   txt("HUMANIDADE EXTINTA! START", 6, 12, 30);
+    if (state == ST_LOSE)  txt("A CURA VENCEU... START", 6, 12, 30);
+}
+
+static void tilesInit(void) {
+    u32 t[8]; u8 c, r;
+    static const u16 col[5] = {0x0A0, 0x0EE, 0x08E, 0x00E, 0x222}; // verde, amarelo, laranja, vermelho, preto
+    for (c = 1; c <= 5; c++) {
+        for (r = 0; r < 8; r++) t[r] = 0x11111111UL * c;
+        VDP_loadTileData(t, TILE_USER_INDEX + c - 1, 1, CPU);
+        PAL_setColor(16 + c, col[c - 1]);
+    }
+}
+
+int main(bool hardReset) {
+    JOY_init();
+    tilesInit();
+    VDP_setTextPlane(BG_A);
+    state = ST_TITLE; ptype = 0; startReg = 4;
+
+    while (TRUE) {
+        u16 pad = JOY_readJoypad(JOY_1);
+        u16 pr = pad & ~prevPad; prevPad = pad;
+        frame++; seedCnt++;
+        setRandomSeed(seedCnt | 1);
+
+        switch (state) {
+        case ST_TITLE:
+            VDP_drawText("C O N T A G I O N   1 6", 8, 3);
+            VDP_drawText("Extingue a humanidade", 9, 6);
+            VDP_drawText("< ESCOLHE O PATOGENO >", 9, 10);
+            txt(typeName[ptype], 16, 12, 10);
+            txt(typeDesc[ptype], 4, 14, 32);
+            VDP_drawText("A: continuar", 14, 20);
+            if ((pr & BUTTON_LEFT) && ptype > 0) ptype--;
+            if ((pr & BUTTON_RIGHT) && ptype < 2) ptype++;
+            if (pr & (BUTTON_A | BUTTON_START)) { VDP_clearPlane(BG_A, TRUE); state = ST_PICK; }
+            break;
+
+        case ST_PICK:
+            VDP_drawText("ESCOLHE O PACIENTE ZERO", 8, 0);
+            drawMap(startReg);
+            VDP_drawText("< >", 17, 15); txt(R[startReg].name, 14, 17, 12);
+            VDP_drawText("A: comecar", 15, 22);
+            if ((pr & BUTTON_LEFT) && startReg > 0) startReg--;
+            if ((pr & BUTTON_RIGHT) && startReg < NREG - 1) startReg++;
+            if (pr & BUTTON_A) { resetGame(); state = ST_PLAY; drawMap(255); }
+            break;
+
+        case ST_PLAY:
+            if ((pr & BUTTON_UP) && cursor > 0) cursor--;
+            if ((pr & BUTTON_DOWN) && cursor < NUP - 1) cursor++;
+            if (pr & BUTTON_B) fast ^= 1;
+            if (pr & BUTTON_START) state = ST_PAUSE;
+            if (pr & BUTTON_A) {
+                const Upgrade *u = &U[cursor];
+                if (!owned[cursor] && (u->req < 0 || owned[(u8)u->req]) && dna >= u->cost) {
+                    dna -= u->cost; owned[cursor] = 1; recalc();
+                    setNews("Evoluiu: ", u->name);
+                }
+            }
+            if (frame >= (fast ? 30 : 60)) { frame = 0; simulate(); drawMap(255); }
+            drawPlay();
+            break;
+
+        case ST_PAUSE:
+            if (pr & BUTTON_START) { state = ST_PLAY; txt("", 6, 12, 30); }
+            drawPlay(); drawOverlay();
+            break;
+
+        case ST_WIN:
+        case ST_LOSE:
+            drawPlay(); drawOverlay();
+            if (pr & BUTTON_START) {
+                VDP_clearPlane(BG_A, TRUE); VDP_clearPlane(BG_B, TRUE);
+                state = ST_TITLE;
+            }
+            break;
+        }
+        SYS_doVBlankProcess();
+    }
+    return 0;
+}
